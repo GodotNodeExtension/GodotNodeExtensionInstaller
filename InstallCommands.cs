@@ -29,7 +29,13 @@ internal struct NugetPackage
 {
     public string Name { get; set; }
     public string Version { get; set; }
-    public bool Required { get; set; }
+
+    /// <summary>
+    /// Optional in component_info.json; absent or null means the package is required, only an explicit
+    /// <c>false</c> skips it. Declared nullable because a <c>bool</c> cannot tell "absent" from "false", which
+    /// is how every declared package ended up skipped (no manifest in the repository sets this field).
+    /// </summary>
+    public bool? Required { get; set; }
 }
 
 internal struct Compatibility
@@ -270,11 +276,17 @@ public class InstallCommands
             }
             // Copy component files
             CopyComponentFiles(componentPath, componentName, projectPath, force);
+            // The documentation travels with the component: the install summary points at it, and without it
+            // a user has no offline description of what was just installed.
+            CopyDocumentationFiles(componentPath, componentName, projectPath);
             // If example option is enabled, copy example files from repo/example/{componentName} to project/example/{componentName}
             if (example)
             {
                 InstallExampleFiles(componentPath, componentName, projectPath);
             }
+            // Component code uses unsafe (GodotSkia's Vulkan helpers): a project created from the default
+            // template does not compile without this switch.
+            EnsureUnsafeBlocks(projectPath);
             // Installation summary
             ShowInstallSummary(info, componentName, projectPath);
         }
@@ -353,7 +365,14 @@ public class InstallCommands
             throw new FileLoadException("File 'component_info.json' not found!");
         }
         var json = File.ReadAllText(infoFile);
-        return JsonSerializer.Deserialize<ComponentInfo>(json);
+        // The manifests are camelCase while these structs are PascalCase, and System.Text.Json matches names
+        // case-sensitively by default: without this option the component object came back empty, so the NuGet
+        // packages and the dependency components it declares were silently never installed.
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var info = JsonSerializer.Deserialize<ComponentInfo>(json, options);
+        if (string.IsNullOrEmpty(info.Name))
+            throw new FileLoadException($"'{infoFile}' could not be read as a component manifest.");
+        return info;
     }
 
     private void InstallNugetDependencies(ComponentInfo info, string projectPath)
@@ -370,7 +389,8 @@ public class InstallCommands
         var csprojFile = csprojFiles[0];
         foreach (var pkg in info.Dependencies.Nuget)
         {
-            if (pkg.Required == false) continue;
+            // Absent means required (see NugetPackage.Required): only an explicit false skips a package.
+            if (pkg.Required is false) continue;
             var name = pkg.Name;
             var version = pkg.Version;
             Console.ForegroundColor = ConsoleColor.Cyan;
@@ -437,38 +457,139 @@ public class InstallCommands
         Console.ResetColor();
     }
     
+    /// <summary>
+    /// Copies <c>Example/&lt;component&gt;</c> into <c>&lt;project&gt;/example/&lt;component&gt;</c> and rewrites the
+    /// paths the copied files carry.
+    /// <para>
+    /// The scenes and scripts are written for the source repository's layout
+    /// (<c>res://Component/&lt;component&gt;/</c>, <c>res://Example/&lt;component&gt;/</c>), while an installed
+    /// project has the component under <c>res://addons/GodotNodeExtension/</c> and the examples under
+    /// <c>res://example/</c> - and almost every reference is a plain path without a uid to fall back on, so an
+    /// untouched copy opens with missing scripts. Every text file of the example is rewritten, not just the
+    /// package name (the example that reads a CSV refers to its own <c>Assets/</c> folder the same way).
+    /// </para>
+    /// </summary>
+    /// <param name="repoComponentPath">Path of the component folder inside the downloaded repository.</param>
+    /// <param name="componentName">Component being installed.</param>
+    /// <param name="projectPath">Target Godot project.</param>
     private void InstallExampleFiles(string repoComponentPath, string componentName, string projectPath)
     {
-        // repoComponentPath: path to the component folder in the temp repo
-        // componentName: name of the component
-        // projectPath: target Godot project path
-        var repoExampleDir = Path.Combine(Path.GetDirectoryName(repoComponentPath) ?? string.Empty, "..", "..", "Example", componentName);
-        repoExampleDir = Path.GetFullPath(repoExampleDir);
+        // repoComponentPath: <repo>/Component/<component>; the examples are siblings of Component/, one level up.
+        var repoDir = Path.GetDirectoryName(Path.GetDirectoryName(repoComponentPath) ?? string.Empty) ?? string.Empty;
+        var repoExampleDir = Path.Combine(repoDir, "Example", componentName);
         var targetExampleDir = Path.Combine(projectPath, "example", componentName);
-        if (Directory.Exists(repoExampleDir))
-        {
-            Directory.CreateDirectory(targetExampleDir);
-            foreach (var file in Directory.GetFiles(repoExampleDir, "*", SearchOption.AllDirectories))
-            {
-                var relPath = file.Substring(repoExampleDir.Length).TrimStart(Path.DirectorySeparatorChar);
-                var destFile = Path.Combine(targetExampleDir, relPath);
-                var destDir = Path.GetDirectoryName(destFile);
-                if (!Directory.Exists(destDir) && destDir != null)
-                    Directory.CreateDirectory(destDir);
-                File.Copy(file, destFile, true);
-            }
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"✔ Example files installed to: {targetExampleDir}");
-            Console.ResetColor();
-        }
-        else
+        if (!Directory.Exists(repoExampleDir))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"⚠ No example found for component: {componentName}");
+            Console.WriteLine($"⚠ No example found for component: {componentName} ({repoExampleDir})");
             Console.ResetColor();
+            return;
         }
+
+        Directory.CreateDirectory(targetExampleDir);
+        var rewritten = 0;
+        foreach (var file in Directory.GetFiles(repoExampleDir, "*", SearchOption.AllDirectories))
+        {
+            var relPath = file.Substring(repoExampleDir.Length).TrimStart(Path.DirectorySeparatorChar);
+            var destFile = Path.Combine(targetExampleDir, relPath);
+            var destDir = Path.GetDirectoryName(destFile);
+            if (!Directory.Exists(destDir) && destDir != null)
+                Directory.CreateDirectory(destDir);
+
+            if (RewriteExamplePaths(file, destFile))
+                rewritten++;
+        }
+
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"✔ Example files installed to: {targetExampleDir} ({rewritten} path(s) rewritten)");
+        Console.ResetColor();
+    }
+
+    /// <summary>Extensions whose text refers to other files by <c>res://</c> path.</summary>
+    private static readonly string[] RewrittenExtensions =
+        [".tscn", ".tres", ".cs", ".gd", ".import", ".cfg", ".json"];
+
+    /// <summary>
+    /// Copy one example file, replacing the source repository's paths with the installed ones. Files that are
+    /// not text (an image, a font) are copied as they are; back to back it returns whether anything changed.
+    /// </summary>
+    /// <param name="source">File in the downloaded repository.</param>
+    /// <param name="dest">Where it goes in the project.</param>
+    private static bool RewriteExamplePaths(string source, string dest)
+    {
+        if (!RewrittenExtensions.Contains(Path.GetExtension(source)))
+        {
+            File.Copy(source, dest, true);
+            return false;
+        }
+
+        var text = File.ReadAllText(source);
+        var rewritten = text
+            // Component/<name>: added under addons/GodotNodeExtension/
+            .Replace("res://Component/", "res://addons/GodotNodeExtension/")
+            // Example/<name> -> example/<name>: the install target, and the case Godot's script lookup needs
+            .Replace("res://Example/", "res://example/");
+        File.WriteAllText(dest, rewritten);
+        return rewritten != text;
     }
     
+    /// <summary>
+    /// Copy <c>Doc/&lt;component&gt;</c> next to the installed component, so the documentation and the code travel
+    /// together (<c>addons/GodotNodeExtension/&lt;component&gt;/Doc/</c>).
+    /// </summary>
+    /// <param name="repoComponentPath">Path of the component folder inside the downloaded repository.</param>
+    /// <param name="componentName">Component being installed.</param>
+    /// <param name="projectPath">Target Godot project.</param>
+    private void CopyDocumentationFiles(string repoComponentPath, string componentName, string projectPath)
+    {
+        var repoDir = Path.GetDirectoryName(Path.GetDirectoryName(repoComponentPath) ?? string.Empty) ?? string.Empty;
+        var repoDocDir = Path.Combine(repoDir, "Doc", componentName);
+        if (!Directory.Exists(repoDocDir)) return;
+
+        var targetDocDir = Path.Combine(projectPath, "addons", "GodotNodeExtension", componentName, "Doc");
+        foreach (var file in Directory.GetFiles(repoDocDir, "*", SearchOption.AllDirectories))
+        {
+            var relPath = file.Substring(repoDocDir.Length).TrimStart(Path.DirectorySeparatorChar);
+            var destFile = Path.Combine(targetDocDir, relPath);
+            var destDir = Path.GetDirectoryName(destFile);
+            if (!Directory.Exists(destDir) && destDir != null)
+                Directory.CreateDirectory(destDir);
+            File.Copy(file, destFile, true);
+        }
+
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"✔ Documentation installed to: {targetDocDir}");
+        Console.ResetColor();
+    }
+
+    /// <summary>
+    /// Make sure the project compiles the component: the code of every component with a GPU or native path uses
+    /// <c>unsafe</c> (the GodotSkia Vulkan helpers, for one), which a project built from Godot's default C#
+    /// template does not allow. The property is added when it is missing, next to the NuGet packages the
+    /// manifest asked for.
+    /// </summary>
+    /// <param name="projectPath">Target Godot project.</param>
+    private void EnsureUnsafeBlocks(string projectPath)
+    {
+        var csprojFiles = Directory.GetFiles(projectPath, "*.csproj", SearchOption.AllDirectories);
+        if (csprojFiles.Length == 0) return;
+
+        var csprojFile = csprojFiles[0];
+        var text = File.ReadAllText(csprojFile);
+        if (text.Contains("AllowUnsafeBlocks", StringComparison.OrdinalIgnoreCase)) return;
+
+        var updated = text.Replace("<Nullable>", "<AllowUnsafeBlocks>true</AllowUnsafeBlocks>\n    <Nullable>");
+        if (updated == text && text.Contains("</PropertyGroup>"))
+            updated = text.Replace("</PropertyGroup>",
+                "  <AllowUnsafeBlocks>true</AllowUnsafeBlocks>\n  </PropertyGroup>");
+        if (updated == text) return;
+
+        File.WriteAllText(csprojFile, updated);
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"✔ AllowUnsafeBlocks enabled in: {Path.GetFileName(csprojFile)}");
+        Console.ResetColor();
+    }
+
     private void ShowInstallSummary(ComponentInfo info, string componentName, string projectPath)
     {
         Console.ForegroundColor = ConsoleColor.Magenta;
@@ -503,9 +624,9 @@ public class InstallCommands
         Console.ResetColor();
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("Next steps:");
-        Console.WriteLine("1. Open your Godot project");
-        Console.WriteLine("2. The component will appear in the 'Create Node' dialog");
-        Console.WriteLine("3. Check README.md for usage examples");
+        Console.WriteLine("1. Build the C# project once (dotnet build) so the editor loads the component");
+        Console.WriteLine("2. Open your Godot project - the component appears in the 'Create Node' dialog");
+        Console.WriteLine($"3. Read the documentation at addons/GodotNodeExtension/{componentName}/Doc/README.md");
         Console.ResetColor();
     }
     

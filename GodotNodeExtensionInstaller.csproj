@@ -14,9 +14,8 @@
         <Copyright>GodotNodeExtension</Copyright>
         <PackageProjectUrl>https://github.com/GodotNodeExtension/GodotNodeExtensionInstaller</PackageProjectUrl>
         <RepositoryUrl>https://github.com/GodotNodeExtension/GodotNodeExtensionInstaller</RepositoryUrl>
-        <Version>1.0.1</Version>
+        <Version>1.0.2</Version>
         <Title>GodotNodeExtensionInstaller</Title>
-        <PackageLicenseUrl></PackageLicenseUrl>
     </PropertyGroup>
 
     <ItemGroup>

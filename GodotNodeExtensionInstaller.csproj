@@ -14,8 +14,11 @@
         <Copyright>GodotNodeExtension</Copyright>
         <PackageProjectUrl>https://github.com/GodotNodeExtension/GodotNodeExtensionInstaller</PackageProjectUrl>
         <RepositoryUrl>https://github.com/GodotNodeExtension/GodotNodeExtensionInstaller</RepositoryUrl>
-        <Version>1.0.2</Version>
+        <Version>1.0.3</Version>
         <Title>GodotNodeExtensionInstaller</Title>
+        <!-- The package carries its own licence and readme: nuget.org reports both as missing otherwise. -->
+        <PackageLicenseFile>LICENSE</PackageLicenseFile>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
 
     <ItemGroup>
@@ -23,6 +26,11 @@
         <PrivateAssets>all</PrivateAssets>
         <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       </PackageReference>
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Include="LICENSE" Pack="true" PackagePath="\" />
+      <None Include="README.md" Pack="true" PackagePath="\" />
     </ItemGroup>
 
 </Project>
